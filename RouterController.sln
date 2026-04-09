@@ -2,6 +2,8 @@
 Microsoft Visual Studio Solution File, Format Version 12.00
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TransactionRouter", "TransactionRouter\TransactionRouter.csproj", "{42972974-A577-420B-BC91-F9AB4258E994}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Test", "Test\Test.csproj", "{47EB47C4-E3CC-4A8A-97FE-51877B7C4A52}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -12,5 +14,9 @@ Global
 		{42972974-A577-420B-BC91-F9AB4258E994}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{42972974-A577-420B-BC91-F9AB4258E994}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{42972974-A577-420B-BC91-F9AB4258E994}.Release|Any CPU.Build.0 = Release|Any CPU
+		{47EB47C4-E3CC-4A8A-97FE-51877B7C4A52}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{47EB47C4-E3CC-4A8A-97FE-51877B7C4A52}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{47EB47C4-E3CC-4A8A-97FE-51877B7C4A52}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{47EB47C4-E3CC-4A8A-97FE-51877B7C4A52}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

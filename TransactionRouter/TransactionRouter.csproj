@@ -20,4 +20,8 @@
         <Protobuf Include="Protos\transaction_router.proto" GrpcServices="None"/>
     </ItemGroup>
 
+    <ItemGroup>
+      <Folder Include="Test\" />
+    </ItemGroup>
+
 </Project>
