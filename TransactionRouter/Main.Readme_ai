@@ -1,0 +1,4 @@
+Tên
+    TransactionRouter
+Mô tả
+    Đây là 1 client của Router dùng để gửi các transaction đến service khác
