@@ -1,13 +1,16 @@
 ﻿using System.Buffers;
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Google.Protobuf;
 using NATS.Client.Core;
 using TransactionRouter.Proto;
+using Gcoder.Poll; // Không gian tên của lớp ObjectPool mới
 
 namespace TransactionRouter;
 
 public class TransactionRouterClient : IAsyncDisposable
 {
+    // Struct lưu thông tin message cần gửi (Struct giúp tránh GC so với Class)
     private readonly struct SendPayload(string subject, byte[] buffer, int length, long playerId)
     {
         public readonly string Subject = subject;
@@ -16,26 +19,27 @@ public class TransactionRouterClient : IAsyncDisposable
         public readonly long PlayerId = playerId;
     }
 
-
     private readonly NatsConnection _nats;
     private readonly int _id;
     private Task? _sendLoopTask;
     private CancellationTokenSource? _cts;
     private const int MaxBatchPayloadSize = 50 * 1024; // 50KB
 
-    private List<CancellationTokenSource> _ctsList = [];
-    private object _ctsListLock = new();
+    // TỐI ƯU: Thread-safe, thay thế List + lock, không cần .ToArray() gây rác
+    private readonly ConcurrentDictionary<CancellationTokenSource, byte> _ctsList = new();
 
+    // Channel để đẩy việc gửi message sang một luồng ngầm (tránh block luồng game)
     private readonly Channel<SendPayload> _sendChannel =
         Channel.CreateUnbounded<SendPayload>(new UnboundedChannelOptions { SingleReader = true });
 
     private readonly Dictionary<string, List<SendPayload>> _pendingPubs = [];
+
+    // TỐI ƯU: Tái sử dụng request để ghép lô (batch) thay vì tạo mới
     private readonly BatchTransactionRequest _batchRequest = new();
     private readonly List<byte[]> _currentBatchBuffers = [];
 
     public TransactionRouterClient(string[] natsUrl, int id)
     {
-        // join natsUrl with ',"
         string url = string.Join(',', natsUrl);
         var opts = NatsOpts.Default with
         {
@@ -76,16 +80,18 @@ public class TransactionRouterClient : IAsyncDisposable
                 {
                     await reader.WaitToReadAsync(ct);
 
+                    // Xóa danh sách batch của vòng lặp trước (Zero GC)
                     foreach (var list in _pendingPubs.Values)
                     {
                         list.Clear();
                     }
 
+                    // Đọc hết các message đang chờ trong Channel để gom lô
                     while (reader.TryRead(out var payload))
                     {
                         if (!_pendingPubs.TryGetValue(payload.Subject, out var list))
                         {
-                            list = [];
+                            list = []; // Khởi tạo 1 lần duy nhất cho mỗi chủ đề mới
                             _pendingPubs[payload.Subject] = list;
                         }
 
@@ -96,20 +102,17 @@ public class TransactionRouterClient : IAsyncDisposable
                 }
                 catch (OperationCanceledException)
                 {
-                    // Lệnh tắt từ CancellationToken -> chủ động thoát vòng lặp
-                    break;
+                    break; // Dừng tiến trình khi có lệnh hủy
                 }
                 catch (Exception)
                 {
-                    // FIX VẤN ĐỀ 2: Bắt lỗi (VD: đứt mạng NATS) để vòng lặp không bị crash chết ngầm.
-                    // Bạn nên gọi _logger.LogError(ex, "Lỗi khi flush batch") ở đây nếu có ILogger.
+                    // Lỗi rớt mạng hoặc bất ngờ, có thể thêm logging ở đây
                 }
             }
         }
         finally
         {
-            // FIX VẤN ĐỀ 3: Dọn dẹp rác khi thoát vòng lặp (Dispose)
-            // Lấy hết các message còn kẹt lại trong Channel và trả buffer về Pool
+            // Dọn dẹp rác khi thoát vòng lặp, trả lại toàn bộ buffer đang kẹt
             while (reader.TryRead(out var payload))
             {
                 ArrayPool<byte>.Shared.Return(payload.Buffer);
@@ -122,75 +125,107 @@ public class TransactionRouterClient : IAsyncDisposable
         int size = message.CalculateSize();
         if (size == 0) return;
 
+        // Mượn mảng từ Pool hệ thống
         byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
         message.WriteTo(buffer.AsSpan(0, size));
 
-        // NẾU: Channel đã đóng (server đang tắt), TryWrite = false -> Trả buffer về Pool
+        // Nếu Channel bị đóng (server đang tắt), trả lại buffer
         if (!_sendChannel.Writer.TryWrite(new SendPayload(subject, buffer, size, accountId)))
         {
             ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    public IDisposable Subscribe<T>(string subject, Action<T, long> handler)
-        where T : IMessage, new()
+    /// <summary>
+    /// Đăng ký nhận tin nhắn. 
+    /// LƯU Ý: Yêu cầu hàm resetAction để dọn dẹp các trường RepeatedField/List của Protobuf khi trả về Pool.
+    /// </summary>
+    public IDisposable Subscribe<T>(string subject, Action<T, long> handler, Action<T>? resetAction = null)
+        where T : class, IMessage, new()
     {
         string finalSubject = $"{subject}.{_id}";
         var cts = new CancellationTokenSource();
         var ct = cts.Token;
 
-        lock (_ctsListLock)
-        {
-            _ctsList.Add(cts);
-        }
+        // Lưu vào dictionary an toàn đa luồng
+        _ctsList.TryAdd(cts, 0);
 
-        _ = SubscribeAsync(finalSubject, ct, handler);
+        _ = SubscribeAsync(finalSubject, ct, handler, resetAction);
 
-        // Trả về Handle. Truyền kèm theo hàm RemoveCts để Handle có thể tự gỡ nó ra khỏi list
         return new SubscriptionHandle(cts, RemoveCts);
     }
 
-    private async Task SubscribeAsync<T>(string finalSubject, CancellationToken ct, Action<T, long> handler)
-        where T : IMessage, new()
+    private async Task SubscribeAsync<T>(string finalSubject, CancellationToken ct, Action<T, long> handler,
+        Action<T>? resetAction = null)
+        where T : class, IMessage, new()
     {
+        // TỐI ƯU: Sử dụng ObjectPool để không khởi tạo 'new T()' liên tục
+        var pool = new ObjectPool<T>(resetAction ?? (_ => { }));
+
+        // TỐI ƯU: Tái sử dụng một đối tượng duy nhất để Deserialize
+        var reusableBatchRequest = new BatchTransactionRequest();
+
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                await foreach (var msg in _nats.SubscribeAsync<byte[]>(finalSubject, cancellationToken: ct))
+                // ZERO GC: Dùng NatsMemoryOwner<byte> thay vì byte[] để mượn vùng nhớ trực tiếp từ NATS
+                await foreach (var msg in _nats.SubscribeAsync<NatsMemoryOwner<byte>>(finalSubject,
+                                   cancellationToken: ct))
                 {
-                    if (msg.Data is null) continue;
+                    // Kiểm tra tin nhắn trống (struct không thể null)
+                    if (msg.Data.Length == 0) continue;
+
                     try
                     {
-                        BatchTransactionRequest batchRequest = BatchTransactionRequest.Parser.ParseFrom(msg.Data);
-                        for (var i  = 0 ; i < batchRequest.PlayerIds.Count; i ++)
+                        // Xoá và Merge (Zero Allocation) thay vì ParseFrom
+                        reusableBatchRequest.Payload.Clear();
+                        reusableBatchRequest.PlayerIds.Clear();
+                        reusableBatchRequest.RouterId = 0;
+
+                        // Truy cập trực tiếp vào Span của NATS, KHÔNG copy dữ liệu
+                        reusableBatchRequest.MergeFrom(msg.Data.Memory.Span);
+
+                        for (var i = 0; i < reusableBatchRequest.PlayerIds.Count; i++)
                         {
-                            var slice = batchRequest.Payload[i];
-                            var playerId = batchRequest.PlayerIds[i];
-                            var evt = new T();
-                            evt.MergeFrom(slice.Span);
-                            handler(evt, playerId);
+                            var slice = reusableBatchRequest.Payload[i];
+                            var playerId = reusableBatchRequest.PlayerIds[i];
+
+                            // Mượn Event từ Pool
+                            var evt = pool.Rent();
+                            try
+                            {
+                                evt.MergeFrom(slice.Span);
+                                handler(evt, playerId); // Xử lý logic
+                            }
+                            finally
+                            {
+                                // Luôn luôn trả về Pool, dù Handler có xảy ra lỗi
+                                pool.Return(evt);
+                            }
                         }
                     }
                     catch (Exception)
                     {
-                        /* Parse/handler error — bỏ qua */
+                        /* Bỏ qua lỗi Deserialize */
+                    }
+                    finally
+                    {
+                        // BẮT BUỘC: Trả vùng nhớ (buffer) lại cho NATS internal pool
+                        // Nếu thiếu dòng này, RAM sẽ bị rò rỉ rất nhanh.
+                        msg.Data.Dispose();
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                // Nhận lệnh tắt server từ hàm Dispose -> Thoát hẳn
                 break;
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                // Rớt mạng hoặc NATS crash. 
-                // _logger.LogWarning(ex, "Mất kết nối NATS ở Subject Watcher. Đang thử lại...");
-
+                // Mất kết nối NATS, chờ 2s rồi thử lại
                 try
                 {
-                    // Nghỉ 2 giây để tránh dội bom CPU rồi vòng lên try lại await foreach
                     await Task.Delay(2000, ct);
                 }
                 catch (OperationCanceledException)
@@ -200,7 +235,6 @@ public class TransactionRouterClient : IAsyncDisposable
             }
         }
     }
-
 
     private async ValueTask FlushPendingAsync()
     {
@@ -217,20 +251,22 @@ public class TransactionRouterClient : IAsyncDisposable
             foreach (var payload in payloadList)
             {
                 var memorySegment = payload.Buffer.AsMemory(0, payload.Length);
+
+                // Đóng gói mảng byte không cần sao chép
                 _batchRequest.Payload.Add(UnsafeByteOperations.UnsafeWrap(memorySegment));
                 _batchRequest.PlayerIds.Add(payload.PlayerId);
 
-                // Track lại để tí nữa trả về Pool
+                // Ghi nhớ để tí nữa trả lại Pool
                 _currentBatchBuffers.Add(payload.Buffer);
 
-                // Kiểm tra kích thước sau khi add
+                // Nếu lô hàng quá dung lượng, tiến hành gửi ngay
                 if (_batchRequest.CalculateSize() > MaxBatchPayloadSize)
                 {
                     await SendCurrentBatch(subject);
                 }
             }
 
-            // Gửi phần còn lại nếu có
+            // Gửi phần còn dư
             if (_batchRequest.PlayerIds.Count > 0)
             {
                 await SendCurrentBatch(subject);
@@ -249,20 +285,20 @@ public class TransactionRouterClient : IAsyncDisposable
         }
         catch (Exception)
         {
-            // Log error
+            // Có thể thêm logging lỗi gửi ở đây
         }
         finally
         {
-            // Trả buffer tổng của batch
+            // Trả buffer tổng
             ArrayPool<byte>.Shared.Return(buffer);
 
-            // Trả CÁC buffer con của các message nhỏ về Pool một cách an toàn
+            // Trả buffer các phần tử con
             foreach (var b in _currentBatchBuffers)
             {
                 ArrayPool<byte>.Shared.Return(b);
             }
 
-            // Reset state
+            // Reset trạng thái lô hàng
             _batchRequest.Payload.Clear();
             _batchRequest.PlayerIds.Clear();
             _currentBatchBuffers.Clear();
@@ -271,25 +307,18 @@ public class TransactionRouterClient : IAsyncDisposable
 
     private void RemoveCts(CancellationTokenSource cts)
     {
-        lock (_ctsListLock)
-        {
-            _ctsList.Remove(cts);
-        }
+        _ctsList.TryRemove(cts, out _);
     }
-
 
     public async ValueTask DisposeAsync()
     {
-        // 1. Dừng nhận message mới vào channel (tuỳ chọn nhưng khuyên dùng)
         _sendChannel.Writer.TryComplete();
 
-        // 2. Kích hoạt Cancel để SendLoopAsync thoát khỏi WaitToReadAsync
         if (_cts != null)
         {
             _cts.Cancel();
         }
 
-        // 3. Đợi Loop kết thúc toàn bộ công việc đang làm dở
         if (_sendLoopTask != null)
         {
             try
@@ -298,22 +327,14 @@ public class TransactionRouterClient : IAsyncDisposable
             }
             catch
             {
-                /* Ignore task cancellation exception */
+                /* Ignore */
             }
         }
 
-        // 4. Dispose CancellationTokenSource
-        if (_cts != null) _cts.Dispose();
+        _cts?.Dispose();
 
-        // 5. Huỷ các Token của Subscriber
-        CancellationTokenSource[] snapShot;
-        lock (_ctsListLock)
-        {
-            snapShot = _ctsList.ToArray();
-            _ctsList.Clear(); // Tránh rò rỉ nếu Dispose được gọi nhiều lần
-        }
-
-        foreach (var cts in snapShot)
+        // TỐI ƯU: Đóng an toàn các Subscriptions mà không tạo Array
+        foreach (var cts in _ctsList.Keys)
         {
             try
             {
@@ -321,17 +342,17 @@ public class TransactionRouterClient : IAsyncDisposable
             }
             catch
             {
-                // Ignore
+                /* Ignore */
             }
 
             cts.Dispose();
         }
 
-        // 6. CUỐI CÙNG mới tắt NATS connection để đảm bảo các tiến trình gửi cuối được hoàn tất
+        _ctsList.Clear();
+
         await _nats.DisposeAsync();
     }
 
-    // Đặt bên trong class TransactionRouterClient
     private sealed class SubscriptionHandle : IDisposable
     {
         private readonly CancellationTokenSource _cts;
@@ -349,19 +370,16 @@ public class TransactionRouterClient : IAsyncDisposable
             if (_disposed) return;
             _disposed = true;
 
-            // 1. Dừng vòng lặp nhận message
             try
             {
                 _cts.Cancel();
             }
             catch
             {
+                /* Ignore */
             }
 
-            // 2. Báo cho class cha xóa token này khỏi list
             _onDispose(_cts);
-
-            // 3. Giải phóng bộ nhớ của token
             _cts.Dispose();
         }
     }
