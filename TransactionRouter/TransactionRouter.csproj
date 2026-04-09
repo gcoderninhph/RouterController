@@ -7,17 +7,18 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="Google.Protobuf" Version="3.34.1"/>
+        <PackageReference Include="Google.Protobuf" Version="3.34.1" />
         <PackageReference Include="Grpc.Tools" Version="2.80.0">
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
             <PrivateAssets>all</PrivateAssets>
         </PackageReference>
-        <PackageReference Include="NATS.Net" Version="2.7.3"/>
-        <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="8.0.0"/>
+        <PackageReference Include="Microsoft.Extensions.ObjectPool" Version="9.0" />
+        <PackageReference Include="NATS.Net" Version="2.7.3" />
+        <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="8.0.0" />
     </ItemGroup>
 
     <ItemGroup>
-        <Protobuf Include="Protos\transaction_router.proto" GrpcServices="None"/>
+        <Protobuf Include="Protos\transaction_router.proto" GrpcServices="None" />
     </ItemGroup>
 
     <ItemGroup>

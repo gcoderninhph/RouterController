@@ -1,16 +1,41 @@
 ﻿using System.Buffers;
 using System.Buffers.Text;
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Google.Protobuf;
+using Microsoft.Extensions.ObjectPool; // Thư viện mới
 using NATS.Client.Core;
 using StackExchange.Redis;
 using TransactionRouter.Proto;
-using Gcoder.Poll;
 
 namespace TransactionRouter;
 
 public class TransactionServiceClient : IAsyncDisposable
 {
+    // Chính sách Pool cho Protobuf Message
+    private sealed class ProtobufPoolPolicy<T> : IPooledObjectPolicy<T> where T : class, IMessage, new()
+    {
+        private readonly Action<T>? _resetAction;
+        public ProtobufPoolPolicy(Action<T>? resetAction) => _resetAction = resetAction;
+        public T Create() => new T();
+        public bool Return(T obj)
+        {
+            _resetAction?.Invoke(obj);
+            return true;
+        }
+    }
+
+    // Chính sách Pool cho List<SendPayload>
+    private sealed class ListPoolPolicy<T> : IPooledObjectPolicy<List<T>>
+    {
+        public List<T> Create() => [];
+        public bool Return(List<T> obj)
+        {
+            obj.Clear();
+            return true;
+        }
+    }
+
     private readonly struct SendPayload(string subject, byte[] buffer, int length, long playerId)
     {
         public readonly string Subject = subject;
@@ -31,22 +56,20 @@ public class TransactionServiceClient : IAsyncDisposable
     private const int MaxBatchPayloadSize = 50 * 1024;
     private const string HeartbeatSetKey = "active_players_ts";
 
-    private readonly List<CancellationTokenSource> _ctsList = [];
-    private readonly object _ctsListLock = new();
+    // TỐI ƯU 1: ConcurrentDictionary thay thế List + lock (Zero Allocation & Thread-Safe)
+    private readonly ConcurrentDictionary<CancellationTokenSource, byte> _ctsList = new();
+    private readonly DefaultObjectPoolProvider _poolProvider = new();
 
     private readonly Channel<SendPayload> _sendChannel =
         Channel.CreateUnbounded<SendPayload>(new UnboundedChannelOptions { SingleReader = true });
 
-    // Các bộ nhớ dùng chung để tái sử dụng (Zero-GC)
     private readonly Dictionary<int, Dictionary<string, List<SendPayload>>> _pendingPubs = [];
     private readonly Dictionary<long, int> _routeMap = [];
     private readonly BatchTransactionRequest _batchRequest = new();
     private readonly List<byte[]> _currentBatchBuffers = [];
 
-    private readonly ObjectPool<List<SendPayload>> _listPool = new(
-        resetAction: list => list.Clear(),
-        lengthDefault: 50
-    );
+    // TỐI ƯU 2: Sử dụng Microsoft ObjectPool cho danh sách tạm
+    private readonly ObjectPool<List<SendPayload>> _listPool;
 
     public TransactionServiceClient(string[] natsUrls, string redisUrl)
     {
@@ -54,6 +77,8 @@ public class TransactionServiceClient : IAsyncDisposable
         var opts = NatsOpts.Default with { Url = url, Name = "TransactionServiceClient" };
         _nats = new NatsConnection(opts);
         _redisUrl = redisUrl;
+        
+        _listPool = _poolProvider.Create(new ListPoolPolicy<SendPayload>());
     }
 
     public async ValueTask ConnectAsync()
@@ -69,22 +94,17 @@ public class TransactionServiceClient : IAsyncDisposable
 
     private void StartSendLoop()
     {
-        _sendLoopTask = Task.Factory.StartNew(
-            () => SendLoopAsync(_cts!.Token), _cts!.Token,
-            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _sendLoopTask = Task.Run(() => SendLoopAsync(_cts!.Token));
     }
 
     private void StartCleanupLoop()
     {
-        _cleanupLoopTask = Task.Factory.StartNew(
-            () => CleanupLoopAsync(_cts!.Token), _cts!.Token,
-            TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+        _cleanupLoopTask = Task.Run(() => CleanupLoopAsync(_cts!.Token));
     }
 
-    // Tiện ích tạo RedisKey mà không tạo String rác
     private static void WriteRedisKey(Span<byte> buffer, long playerId, out int bytesWritten)
     {
-        // "pr:" ASCII
+        // "pr:" ASCII (Tối ưu tạo RedisKey không qua String)
         buffer[0] = 112;
         buffer[1] = 114;
         buffer[2] = 58;
@@ -122,19 +142,14 @@ public class TransactionServiceClient : IAsyncDisposable
 
                         await ProcessAndRouteBatchAsync(currentPayloads, playerIdsArray, pCount);
 
-                        // Cập nhật Heartbeat (Task này tự trả mảng về Pool qua ContinueWith)
-                        UpdateHeartbeatsAsync(playerIdsArray, pCount);
+                        // TỐI ƯU 3: Dùng await thay vì ContinueWith để tránh cấp phát closure ngầm (Zero GC Task)
+                        await UpdateHeartbeatsAsync(playerIdsArray, pCount);
 
                         ArrayPool<long>.Shared.Return(playerIdsArray);
                     }
                 }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception)
-                {
-                }
+                catch (OperationCanceledException) { break; }
+                catch (Exception) { /* Log here */ }
             }
         }
         finally
@@ -153,12 +168,11 @@ public class TransactionServiceClient : IAsyncDisposable
         for (int i = 0; i < pCount; i++)
         {
             WriteRedisKey(keyBuffer, playerIdsArray[i], out int len);
-            redisKeys[i] =
-                (RedisKey)keyBuffer[..len]
-                    .ToArray(); // Chấp nhận ToArray ở đây vì RedisKey struct cần copy dữ liệu Span
+            // StackExchange.Redis bắt buộc phải clone byte array để giữ reference an toàn
+            redisKeys[i] = (RedisKey)keyBuffer[..len].ToArray(); 
         }
 
-        // Padding mảng để tránh rác ở cuối khi gửi lên Redis
+        // Padding mảng để tránh lỗi tra cứu rác ở cuối
         var lastValidKey = redisKeys[pCount - 1];
         for (int i = pCount; i < redisKeys.Length; i++) redisKeys[i] = lastValidKey;
 
@@ -172,14 +186,13 @@ public class TransactionServiceClient : IAsyncDisposable
                 _routeMap[playerIdsArray[i]] = routerId;
         }
 
-        // Dọn dẹp pending cũ
+        // Dọn dẹp pending cũ về Pool
         foreach (var routerDict in _pendingPubs.Values)
         {
             foreach (var list in routerDict.Values) _listPool.Return(list);
             routerDict.Clear();
         }
 
-        // Gom Batch
         foreach (var payload in payloads)
         {
             if (_routeMap.TryGetValue(payload.PlayerId, out int routerId))
@@ -192,7 +205,7 @@ public class TransactionServiceClient : IAsyncDisposable
 
                 if (!subjectDict.TryGetValue(payload.Subject, out var list))
                 {
-                    list = _listPool.Rent();
+                    list = _listPool.Get(); // Sử dụng Microsoft Pool
                     subjectDict[payload.Subject] = list;
                 }
 
@@ -244,9 +257,7 @@ public class TransactionServiceClient : IAsyncDisposable
             _batchRequest.WriteTo(buffer.AsSpan(0, size));
             await _nats.PublishAsync(finalSubject, buffer.AsMemory(0, size));
         }
-        catch
-        {
-        }
+        catch { }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
@@ -257,7 +268,7 @@ public class TransactionServiceClient : IAsyncDisposable
         }
     }
 
-    private void UpdateHeartbeatsAsync(long[] playerIds, int count)
+    private async Task UpdateHeartbeatsAsync(long[] playerIds, int count)
     {
         if (_redisDb == null || count == 0) return;
 
@@ -269,8 +280,15 @@ public class TransactionServiceClient : IAsyncDisposable
         var lastValid = entries[count - 1];
         for (int i = count; i < entries.Length; i++) entries[i] = lastValid;
 
-        _ = _redisDb.SortedSetAddAsync(HeartbeatSetKey, entries).ContinueWith(
-            (task, state) => { ArrayPool<SortedSetEntry>.Shared.Return((SortedSetEntry[])state!); }, entries);
+        try
+        {
+            await _redisDb.SortedSetAddAsync(HeartbeatSetKey, entries);
+        }
+        catch { }
+        finally
+        {
+            ArrayPool<SortedSetEntry>.Shared.Return(entries);
+        }
     }
 
     public void Publish(long playerId, string subject, IMessage message)
@@ -285,28 +303,27 @@ public class TransactionServiceClient : IAsyncDisposable
             ArrayPool<byte>.Shared.Return(buffer);
     }
 
-    public IDisposable Subscribe<T>(string subject, Action<T, long> handler, Action<T> resetAction)
-        where T : IMessage, new()
+    public IDisposable Subscribe<T>(string subject, Action<T, long> handler, Action<T>? resetAction = null)
+        where T : class, IMessage, new()
     {
         var cts = new CancellationTokenSource();
-        var ct = cts.Token;
-        lock (_ctsListLock)
-        {
-            _ctsList.Add(cts);
-        }
+        _ctsList.TryAdd(cts, 0);
 
-        var eventPool = new ObjectPool<T>(resetAction, 100);
-        _ = SubscribeAsync(subject, ct, handler, eventPool);
+        var policy = new ProtobufPoolPolicy<T>(resetAction);
+        var eventPool = _poolProvider.Create(policy);
+        
+        _ = SubscribeAsync(subject, cts.Token, handler, eventPool);
 
-        return new SubscriptionHandle(cts, RemoveCts);
+        return new SubscriptionHandle(cts, c => _ctsList.TryRemove(c, out _));
     }
 
     private async Task SubscribeAsync<T>(string subject, CancellationToken ct, Action<T, long> handler,
         ObjectPool<T> eventPool)
-        where T : IMessage, new()
+        where T : class, IMessage, new()
     {
         var reusableBatchRequest = new BatchTransactionRequest();
 
+        // TỐI ƯU 4: Zero GC với NatsMemoryOwner
         await foreach (var msg in _nats.SubscribeAsync<NatsMemoryOwner<byte>>(subject, cancellationToken: ct))
         {
             using (msg.Data)
@@ -335,23 +352,40 @@ public class TransactionServiceClient : IAsyncDisposable
                         var lastValid = redisBatchUpdate[pCount - 1];
                         for (int i = pCount; i < redisBatchUpdate.Length; i++) redisBatchUpdate[i] = lastValid;
 
-                        _ = _redisDb.StringSetAsync(redisBatchUpdate).ContinueWith((t, s) =>
-                            ArrayPool<KeyValuePair<RedisKey, RedisValue>>.Shared.Return(
-                                (KeyValuePair<RedisKey, RedisValue>[])s!), redisBatchUpdate);
+                        // TỐI ƯU 5: Tách riêng việc lưu Redis ra một hàm Async để không dùng ContinueWith
+                        _ = UpdateRedisRoutingAsync(redisBatchUpdate);
 
                         for (var i = 0; i < pCount; i++)
                         {
-                            T evt = eventPool.Rent();
-                            evt.MergeFrom(reusableBatchRequest.Payload[i].Span);
-                            handler(evt, reusableBatchRequest.PlayerIds[i]);
-                            eventPool.Return(evt);
+                            T evt = eventPool.Get();
+                            try
+                            {
+                                evt.MergeFrom(reusableBatchRequest.Payload[i].Span);
+                                handler(evt, reusableBatchRequest.PlayerIds[i]);
+                            }
+                            finally
+                            {
+                                eventPool.Return(evt);
+                            }
                         }
                     }
                 }
-                catch
-                {
-                }
+                catch { }
             }
+        }
+    }
+
+    // Helper giải quyết việc lưu thông tin Redis dạng Fire-and-Forget không sinh rác delegate
+    private async Task UpdateRedisRoutingAsync(KeyValuePair<RedisKey, RedisValue>[] batchUpdate)
+    {
+        try
+        {
+            await _redisDb!.StringSetAsync(batchUpdate);
+        }
+        catch { }
+        finally
+        {
+            ArrayPool<KeyValuePair<RedisKey, RedisValue>>.Shared.Return(batchUpdate);
         }
     }
 
@@ -384,72 +418,32 @@ public class TransactionServiceClient : IAsyncDisposable
 
                     await _redisDb.KeyDeleteAsync(keysToDelete);
                     await _redisDb.SortedSetRemoveAsync(HeartbeatSetKey, expiredPlayers);
+                    
                     ArrayPool<RedisKey>.Shared.Return(keysToDelete);
                 }
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch
-            {
-            }
+            catch (OperationCanceledException) { break; }
+            catch { }
         }
-    }
-
-    private void RemoveCts(CancellationTokenSource cts)
-    {
-        lock (_ctsListLock) _ctsList.Remove(cts);
     }
 
     public async ValueTask DisposeAsync()
     {
         _sendChannel.Writer.TryComplete();
-        if (_cts != null) _cts.Cancel();
-        if (_sendLoopTask != null)
-            try
-            {
-                await _sendLoopTask;
-            }
-            catch
-            {
-            }
+        _cts?.Cancel();
 
-        if (_cleanupLoopTask != null)
-            try
-            {
-                await _cleanupLoopTask;
-            }
-            catch
-            {
-            }
+        if (_sendLoopTask != null) try { await _sendLoopTask; } catch { }
+        if (_cleanupLoopTask != null) try { await _cleanupLoopTask; } catch { }
 
-        if (_cts != null) _cts.Dispose();
+        _cts?.Dispose();
 
-        CancellationTokenSource[] snapShot;
-        int count;
-        lock (_ctsListLock)
+        // Tháo gỡ cực nhẹ, không cần Lock và CopyTo mảng
+        foreach (var cts in _ctsList.Keys)
         {
-            count = _ctsList.Count;
-            snapShot = ArrayPool<CancellationTokenSource>.Shared.Rent(count);
-            _ctsList.CopyTo(snapShot, 0);
-            _ctsList.Clear();
+            try { cts.Cancel(); } catch { }
+            cts.Dispose();
         }
-
-        for (int i = 0; i < count; i++)
-        {
-            try
-            {
-                snapShot[i]?.Cancel();
-            }
-            catch
-            {
-            }
-
-            snapShot[i]?.Dispose();
-        }
-
-        ArrayPool<CancellationTokenSource>.Shared.Return(snapShot, true);
+        _ctsList.Clear();
 
         await _nats.DisposeAsync();
         if (_redisConnection != null) await _redisConnection.DisposeAsync();
@@ -459,19 +453,11 @@ public class TransactionServiceClient : IAsyncDisposable
         : IDisposable
     {
         private bool _disposed;
-
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            try
-            {
-                cts.Cancel();
-            }
-            catch
-            {
-            }
-
+            try { cts.Cancel(); } catch { }
             onDispose(cts);
             cts.Dispose();
         }
