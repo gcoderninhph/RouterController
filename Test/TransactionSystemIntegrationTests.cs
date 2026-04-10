@@ -690,5 +690,150 @@ namespace TransactionRouter.Tests
             Assert.That(receiveCount, Is.EqualTo(1),
                 "LỖI: Hủy Subscribe rồi nhưng vẫn tiếp tục nhận được tin nhắn ngầm!");
         }
+
+        // =========================================================================================
+        // CASE 11: BASIC ASYNC PING PONG (Đảm bảo Handler Func<..., Task> hoạt động chuẩn)
+        // =========================================================================================
+        [Test]
+        public async Task Basic_Async_PingPong_E2E_Success()
+        {
+            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 1);
+
+            await service.ConnectAsync();
+            await router.ConnectAsync();
+
+            var tcsServiceReceive = new TaskCompletionSource<bool>();
+            var tcsRouterReceive = new TaskCompletionSource<bool>();
+            long testPlayerId = 9999;
+
+            // 1. Service lắng nghe bằng ASYNC HANDLER
+            using var sub1 = service.Subscribe<StringValue>("async.auth.login", async (msg, pId) =>
+            {
+                await Task.Delay(50); // Giả lập I/O delay (gọi DB, API...)
+                Assert.That(pId, Is.EqualTo(testPlayerId));
+                Assert.That(msg.Value, Is.EqualTo("AsyncHelloService"));
+                tcsServiceReceive.TrySetResult(true);
+            }, null, msg => msg.Value = string.Empty);
+
+            // 2. Router lắng nghe bằng ASYNC HANDLER
+            using var sub2 = router.Subscribe<StringValue>("async.game.events", async (msg, pId) =>
+            {
+                await Task.Delay(50); // Giả lập tính toán logic
+                Assert.That(pId, Is.EqualTo(testPlayerId));
+                Assert.That(msg.Value, Is.EqualTo("AsyncHelloRouter"));
+                tcsRouterReceive.TrySetResult(true);
+            });
+
+            // Hành động: Router gửi Service -> Service học Route
+            router.Publish(testPlayerId, "async.auth.login", new StringValue { Value = "AsyncHelloService" });
+
+            // Đợi Service nhận được
+            await Task.WhenAny(tcsServiceReceive.Task, Task.Delay(2000));
+            Assert.That(tcsServiceReceive.Task.IsCompletedSuccessfully, Is.True,
+                "Service không nhận được message async.");
+
+            await Task.Delay(200); // Chờ update Redis route
+
+            // Hành động: Service phản hồi lại Router
+            service.Publish(testPlayerId, "async.game.events", new StringValue { Value = "AsyncHelloRouter" });
+
+            // Đợi Router nhận được
+            await Task.WhenAny(tcsRouterReceive.Task, Task.Delay(2000));
+            Assert.That(tcsRouterReceive.Task.IsCompletedSuccessfully, Is.True,
+                "Router không nhận được message async.");
+        }
+
+        // =========================================================================================
+        // CASE 12: ASYNC BATCH PROCESSING (Đảm bảo việc Await Handler không làm rớt gói tin trong Batch)
+        // =========================================================================================
+        [Test]
+        public async Task Async_Handler_Should_Process_Batch_Correctly_With_Delays()
+        {
+            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 2);
+
+            await service.ConnectAsync();
+            await router.ConnectAsync();
+
+            int totalMessages = 20;
+            int receivedCount = 0;
+            var tcs = new TaskCompletionSource<bool>();
+
+            // Setup Redis route cho Service (Player 1 -> Router 2)
+            await _redis.GetDatabase().StringSetAsync("pr:1", 2);
+            await Task.Delay(100);
+
+            // Đăng ký Async Handler trên Router. 
+            // Cố tình delay 10ms mỗi message để xem luồng for-loop gom batch có bị đứt gãy không.
+            using var sub = router.Subscribe<StringValue>("async.batch.test", async (msg, pId) =>
+            {
+                await Task.Delay(10); // Lệnh await quan trọng nhất để test
+                var current = Interlocked.Increment(ref receivedCount);
+                if (current == totalMessages)
+                {
+                    tcs.TrySetResult(true);
+                }
+            });
+
+            // Service gửi ồ ạt 20 messages cùng lúc để ép thành 1 Batch
+            for (int i = 0; i < totalMessages; i++)
+            {
+                service.Publish(1, "async.batch.test", new StringValue { Value = $"Msg_{i}" });
+            }
+
+            // Timeout được nới lỏng ra 3 giây (20 msg * 10ms + network delay)
+            bool completed = await Task.WhenAny(tcs.Task, Task.Delay(3000)) == tcs.Task;
+
+            Assert.That(completed, Is.True,
+                $"Chỉ nhận được {receivedCount}/{totalMessages} messages do Async Handler bị lỗi hoặc block luồng.");
+            Assert.That(receivedCount, Is.EqualTo(totalMessages));
+        }
+
+        // =========================================================================================
+        // CASE 13: ASYNC UNSUBSCRIBE (Kiểm tra rò rỉ bộ nhớ khi hủy đăng ký Async Handler)
+        // =========================================================================================
+        [Test]
+        public async Task Dispose_Async_Subscription_Should_Stop_Receiving()
+        {
+            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 3);
+
+            await service.ConnectAsync();
+            await router.ConnectAsync();
+
+            await _redis.GetDatabase().StringSetAsync("pr:1", 3); // Route: Player 1 -> Router 3
+            await Task.Delay(100);
+
+            int receiveCount = 0;
+
+            // Router đăng ký Async
+            var subscription = router.Subscribe<StringValue>("async.unsubscribe.test", async (msg, pId) =>
+            {
+                await Task.Delay(10); // Async logic
+                Interlocked.Increment(ref receiveCount);
+            });
+
+            // Gửi message mồi
+            service.Publish(1, "async.unsubscribe.test", new StringValue { Value = "Msg1" });
+            await Task.Delay(500);
+
+            Assert.That(receiveCount, Is.EqualTo(1), "Message mồi chưa được nhận.");
+
+            // ==========================================
+            // HỦY ĐĂNG KÝ ASYNC SUBSCRIPTION
+            // ==========================================
+            subscription.Dispose();
+            await Task.Delay(100);
+
+            // Gửi tiếp 2 messages
+            service.Publish(1, "async.unsubscribe.test", new StringValue { Value = "Msg2" });
+            service.Publish(1, "async.unsubscribe.test", new StringValue { Value = "Msg3" });
+
+            await Task.Delay(500);
+
+            Assert.That(receiveCount, Is.EqualTo(1),
+                "LỖI: Hủy Subscribe Async nhưng CancellationToken vẫn chưa kết thúc luồng!");
+        }
     }
 }
