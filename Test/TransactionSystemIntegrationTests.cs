@@ -60,7 +60,7 @@ namespace TransactionRouter.Tests
                 Assert.That(pId, Is.EqualTo(testPlayerId));
                 Assert.That(msg.Value, Is.EqualTo("HelloService"));
                 tcsServiceReceive.TrySetResult(true);
-            }, msg => msg.Value = string.Empty);
+            }, null, msg => msg.Value = string.Empty);
 
             // 2. Router lắng nghe "game.events" từ Service
             using var sub2 = router.Subscribe<StringValue>("game.events", (msg, pId) =>
@@ -165,7 +165,7 @@ namespace TransactionRouter.Tests
             {
                 Interlocked.Increment(ref received);
                 if (received == 2) tcs.TrySetResult(true);
-            }, msg => msg.Value = string.Empty);
+            }, null, msg => msg.Value = string.Empty);
 
             // MaxBatchPayloadSize = 50 * 1024 (50KB)
             // Tạo 1 string khoảng 30KB

@@ -18,6 +18,7 @@ public class TransactionServiceClient : IAsyncDisposable
         private readonly Action<T>? _resetAction;
         public ProtobufPoolPolicy(Action<T>? resetAction) => _resetAction = resetAction;
         public T Create() => new T();
+
         public bool Return(T obj)
         {
             _resetAction?.Invoke(obj);
@@ -29,6 +30,7 @@ public class TransactionServiceClient : IAsyncDisposable
     private sealed class ListPoolPolicy<T> : IPooledObjectPolicy<List<T>>
     {
         public List<T> Create() => [];
+
         public bool Return(List<T> obj)
         {
             obj.Clear();
@@ -77,7 +79,7 @@ public class TransactionServiceClient : IAsyncDisposable
         var opts = NatsOpts.Default with { Url = url, Name = "TransactionServiceClient" };
         _nats = new NatsConnection(opts);
         _redisUrl = redisUrl;
-        
+
         _listPool = _poolProvider.Create(new ListPoolPolicy<SendPayload>());
     }
 
@@ -148,8 +150,14 @@ public class TransactionServiceClient : IAsyncDisposable
                         ArrayPool<long>.Shared.Return(playerIdsArray);
                     }
                 }
-                catch (OperationCanceledException) { break; }
-                catch (Exception) { /* Log here */ }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception)
+                {
+                    /* Log here */
+                }
             }
         }
         finally
@@ -169,7 +177,7 @@ public class TransactionServiceClient : IAsyncDisposable
         {
             WriteRedisKey(keyBuffer, playerIdsArray[i], out int len);
             // StackExchange.Redis bắt buộc phải clone byte array để giữ reference an toàn
-            redisKeys[i] = (RedisKey)keyBuffer[..len].ToArray(); 
+            redisKeys[i] = (RedisKey)keyBuffer[..len].ToArray();
         }
 
         // Padding mảng để tránh lỗi tra cứu rác ở cuối
@@ -257,7 +265,9 @@ public class TransactionServiceClient : IAsyncDisposable
             _batchRequest.WriteTo(buffer.AsSpan(0, size));
             await _nats.PublishAsync(finalSubject, buffer.AsMemory(0, size));
         }
-        catch { }
+        catch
+        {
+        }
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
@@ -284,7 +294,9 @@ public class TransactionServiceClient : IAsyncDisposable
         {
             await _redisDb.SortedSetAddAsync(HeartbeatSetKey, entries);
         }
-        catch { }
+        catch
+        {
+        }
         finally
         {
             ArrayPool<SortedSetEntry>.Shared.Return(entries);
@@ -303,7 +315,8 @@ public class TransactionServiceClient : IAsyncDisposable
             ArrayPool<byte>.Shared.Return(buffer);
     }
 
-    public IDisposable Subscribe<T>(string subject, Action<T, long> handler, Action<T>? resetAction = null)
+    public IDisposable Subscribe<T>(string subject, Action<T, long> handler, string? group = null,
+        Action<T>? resetAction = null)
         where T : class, IMessage, new()
     {
         var cts = new CancellationTokenSource();
@@ -311,20 +324,44 @@ public class TransactionServiceClient : IAsyncDisposable
 
         var policy = new ProtobufPoolPolicy<T>(resetAction);
         var eventPool = _poolProvider.Create(policy);
-        
-        _ = SubscribeAsync(subject, cts.Token, handler, eventPool);
+
+        _ = SubscribeAsync(subject, group, cts.Token, handler, null, eventPool);
 
         return new SubscriptionHandle(cts, c => _ctsList.TryRemove(c, out _));
     }
 
-    private async Task SubscribeAsync<T>(string subject, CancellationToken ct, Action<T, long> handler,
+    public IDisposable Subscribe<T>(string subject, Func<T, long, Task> handler, string? group = null,
+        Action<T>? resetAction = null)
+        where T : class, IMessage, new()
+    {
+        var cts = new CancellationTokenSource();
+        _ctsList.TryAdd(cts, 0);
+
+        var policy = new ProtobufPoolPolicy<T>(resetAction);
+        var eventPool = _poolProvider.Create(policy);
+
+        _ = SubscribeAsync(subject, group, cts.Token, null, handler, eventPool);
+
+        return new SubscriptionHandle(cts, c => _ctsList.TryRemove(c, out _));
+    }
+
+
+    private async Task SubscribeAsync<T>(string subject, string? group, CancellationToken ct,
+        Action<T, long>? handler,
+        Func<T, long, Task>? handler2,
         ObjectPool<T> eventPool)
         where T : class, IMessage, new()
     {
         var reusableBatchRequest = new BatchTransactionRequest();
 
+        var task = group != null
+            ? _nats.SubscribeAsync<NatsMemoryOwner<byte>>(subject, queueGroup: group,
+                cancellationToken: ct)
+            : _nats.SubscribeAsync<NatsMemoryOwner<byte>>(subject, cancellationToken: ct);
+
+
         // TỐI ƯU 4: Zero GC với NatsMemoryOwner
-        await foreach (var msg in _nats.SubscribeAsync<NatsMemoryOwner<byte>>(subject, cancellationToken: ct))
+        await foreach (var msg in task)
         {
             using (msg.Data)
             {
@@ -361,7 +398,12 @@ public class TransactionServiceClient : IAsyncDisposable
                             try
                             {
                                 evt.MergeFrom(reusableBatchRequest.Payload[i].Span);
-                                handler(evt, reusableBatchRequest.PlayerIds[i]);
+                                if (handler != null)
+                                    handler(evt, reusableBatchRequest.PlayerIds[i]);
+                                if (handler2 != null)
+                                {
+                                    await handler2(evt, reusableBatchRequest.PlayerIds[i]);
+                                }
                             }
                             finally
                             {
@@ -370,7 +412,9 @@ public class TransactionServiceClient : IAsyncDisposable
                         }
                     }
                 }
-                catch { }
+                catch
+                {
+                }
             }
         }
     }
@@ -382,7 +426,9 @@ public class TransactionServiceClient : IAsyncDisposable
         {
             await _redisDb!.StringSetAsync(batchUpdate);
         }
-        catch { }
+        catch
+        {
+        }
         finally
         {
             ArrayPool<KeyValuePair<RedisKey, RedisValue>>.Shared.Return(batchUpdate);
@@ -418,12 +464,17 @@ public class TransactionServiceClient : IAsyncDisposable
 
                     await _redisDb.KeyDeleteAsync(keysToDelete);
                     await _redisDb.SortedSetRemoveAsync(HeartbeatSetKey, expiredPlayers);
-                    
+
                     ArrayPool<RedisKey>.Shared.Return(keysToDelete);
                 }
             }
-            catch (OperationCanceledException) { break; }
-            catch { }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch
+            {
+            }
         }
     }
 
@@ -432,17 +483,40 @@ public class TransactionServiceClient : IAsyncDisposable
         _sendChannel.Writer.TryComplete();
         _cts?.Cancel();
 
-        if (_sendLoopTask != null) try { await _sendLoopTask; } catch { }
-        if (_cleanupLoopTask != null) try { await _cleanupLoopTask; } catch { }
+        if (_sendLoopTask != null)
+            try
+            {
+                await _sendLoopTask;
+            }
+            catch
+            {
+            }
+
+        if (_cleanupLoopTask != null)
+            try
+            {
+                await _cleanupLoopTask;
+            }
+            catch
+            {
+            }
 
         _cts?.Dispose();
 
         // Tháo gỡ cực nhẹ, không cần Lock và CopyTo mảng
         foreach (var cts in _ctsList.Keys)
         {
-            try { cts.Cancel(); } catch { }
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+            }
+
             cts.Dispose();
         }
+
         _ctsList.Clear();
 
         await _nats.DisposeAsync();
@@ -453,11 +527,19 @@ public class TransactionServiceClient : IAsyncDisposable
         : IDisposable
     {
         private bool _disposed;
+
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            try { cts.Cancel(); } catch { }
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+            }
+
             onDispose(cts);
             cts.Dispose();
         }
