@@ -16,6 +16,7 @@ public class TransactionRouterClient : IAsyncDisposable
         private readonly Action<T>? _resetAction;
         public ProtobufPoolPolicy(Action<T>? resetAction) => _resetAction = resetAction;
         public T Create() => new T();
+
         public bool Return(T obj)
         {
             _resetAction?.Invoke(obj);
@@ -79,12 +80,16 @@ public class TransactionRouterClient : IAsyncDisposable
                         list = [];
                         _pendingPubs[payload.Subject] = list;
                     }
+
                     list.Add(payload);
                 }
+
                 await FlushPendingAsync();
             }
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+        }
         finally
         {
             while (reader.TryRead(out var payload)) ArrayPool<byte>.Shared.Return(payload.buffer);
@@ -116,12 +121,31 @@ public class TransactionRouterClient : IAsyncDisposable
         var policy = new ProtobufPoolPolicy<T>(resetAction);
         var pool = _poolProvider.Create(policy);
 
-        _ = SubscribeAsync(finalSubject, cts.Token, handler, pool);
+        _ = SubscribeAsync(finalSubject, cts.Token, handler, null, pool);
 
         return new SubscriptionHandle(cts, c => _ctsList.TryRemove(c, out _));
     }
 
-    private async Task SubscribeAsync<T>(string subject, CancellationToken ct, Action<T, long> handler, ObjectPool<T> pool)
+    public IDisposable Subscribe<T>(string subject, Func<T, long, Task> handler, Action<T>? resetAction = null)
+        where T : class, IMessage, new()
+    {
+        string finalSubject = $"{subject}.{_id}";
+        var cts = new CancellationTokenSource();
+        _ctsList.TryAdd(cts, 0);
+
+        // Khởi tạo Pool "chính chủ" Microsoft cho từng Subscriber
+        var policy = new ProtobufPoolPolicy<T>(resetAction);
+        var pool = _poolProvider.Create(policy);
+
+        _ = SubscribeAsync(finalSubject, cts.Token, null, handler, pool);
+
+        return new SubscriptionHandle(cts, c => _ctsList.TryRemove(c, out _));
+    }
+
+    private async Task SubscribeAsync<T>(string subject, CancellationToken ct,
+        Action<T, long>? handler,
+        Func<T, long, Task>? asyncHandler,
+        ObjectPool<T> pool)
         where T : class, IMessage, new()
     {
         var reusableBatch = new BatchTransactionRequest();
@@ -144,7 +168,10 @@ public class TransactionRouterClient : IAsyncDisposable
                         try
                         {
                             evt.MergeFrom(reusableBatch.Payload[i].Span);
-                            handler(evt, reusableBatch.PlayerIds[i]);
+                            if (handler != null)
+                                handler(evt, reusableBatch.PlayerIds[i]);
+                            else if (asyncHandler != null)
+                                await asyncHandler(evt, reusableBatch.PlayerIds[i]);
                         }
                         finally
                         {
@@ -154,8 +181,13 @@ public class TransactionRouterClient : IAsyncDisposable
                 }
             }
         }
-        catch (OperationCanceledException) { }
-        catch (Exception) { /* Log retry logic here */ }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception)
+        {
+            /* Log retry logic here */
+        }
     }
 
     private async ValueTask FlushPendingAsync()
@@ -176,6 +208,7 @@ public class TransactionRouterClient : IAsyncDisposable
 
                 if (_batchRequest.CalculateSize() > MaxBatchPayloadSize) await SendBatch(entry.Key);
             }
+
             if (_batchRequest.PlayerIds.Count > 0) await SendBatch(entry.Key);
         }
     }
@@ -204,13 +237,24 @@ public class TransactionRouterClient : IAsyncDisposable
         _sendChannel.Writer.TryComplete();
         _cts?.Cancel();
         if (_sendLoopTask != null) await _sendLoopTask;
-        
-        foreach (var c in _ctsList.Keys) { c.Cancel(); c.Dispose(); }
+
+        foreach (var c in _ctsList.Keys)
+        {
+            c.Cancel();
+            c.Dispose();
+        }
+
         await _nats.DisposeAsync();
     }
 
-    private sealed class SubscriptionHandle(CancellationTokenSource cts, Action<CancellationTokenSource> dispose) : IDisposable
+    private sealed class SubscriptionHandle(CancellationTokenSource cts, Action<CancellationTokenSource> dispose)
+        : IDisposable
     {
-        public void Dispose() { cts.Cancel(); dispose(cts); cts.Dispose(); }
+        public void Dispose()
+        {
+            cts.Cancel();
+            dispose(cts);
+            cts.Dispose();
+        }
     }
 }
