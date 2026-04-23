@@ -24,7 +24,7 @@ public class TransactionClient : IDisposable
     }
 
 
-    public void Publish( string topic,long accountId, IMessage message)
+    public void Publish(string topic, long accountId, IMessage message)
     {
         _natify.Publish(topic, new TransactionRequest
         {
@@ -55,6 +55,13 @@ public class TransactionClient : IDisposable
                 await handler(message, data.Value.PlayerId);
             }
         );
+    }
+
+    public Task<TRes> RequestAsync<TReq, TRes>(string topic,TReq body, TimeSpan timeout)
+        where TReq : class, IMessage, new()
+        where TRes : class, IMessage, new()
+    {
+        return _natify.RequestAsync<TReq, TRes>(topic, body, timeout);
     }
 
 

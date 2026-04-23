@@ -75,6 +75,17 @@ public class TransactionServer : IDisposable
         }
     }
 
+    public void OnRequest<TReq, TRes>(string topic, Func<TReq, Task<TRes>> handler)
+        where TReq : class, IMessage, new()
+        where TRes : class, IMessage, new()
+    {
+        _natifyServer.OnRequest<TReq, TRes>(topic, async request =>
+        {
+            var result = await handler(request.request);
+            return result;
+        });
+    }
+
     public void Subscribe<T>(string subject, Action<T, long> handler)
         where T : class, IMessage, new()
     {
