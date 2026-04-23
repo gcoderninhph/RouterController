@@ -44,7 +44,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Basic_PingPong_E2E_Success()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 1);
 
             await service.ConnectAsync();
@@ -95,7 +95,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Massive_Throughput_100k_Requests_StressTest()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 99);
 
             await service.ConnectAsync();
@@ -150,7 +150,7 @@ namespace TransactionRouter.Tests
         public async Task Exceed_MaxBatchSize_Should_Trigger_Immediate_Flush()
         {
             // Khởi tạo cả Service và Router
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 2);
 
             await service.ConnectAsync();
@@ -187,7 +187,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task MultiRouter_Should_Route_To_Correct_RouterClient()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router1 = new TransactionRouterClient(new[] { NatsUrl }, id: 10);
             await using var router2 = new TransactionRouterClient(new[] { NatsUrl }, id: 20);
 
@@ -251,7 +251,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Heartbeat_Should_Update_To_Redis_SortedSet()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await service.ConnectAsync();
 
             // Fake route để Service không bỏ qua gói tin (Vì nếu route rỗng, buffer bị trả về pool ngay lập tức)
@@ -277,7 +277,7 @@ namespace TransactionRouter.Tests
         public async Task Performance_Throughput_Benchmarks(int totalMessages, int totalPlayers, string testName)
         {
             // 1. Khởi tạo
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 99);
 
             await service.ConnectAsync();
@@ -335,13 +335,13 @@ namespace TransactionRouter.Tests
             double elapsedMs = sw.Elapsed.TotalMilliseconds;
             double rps = (totalMessages / elapsedMs) * 1000;
 
-            TestContext.WriteLine("=========================================");
-            TestContext.WriteLine($"[{testName}] Báo cáo Hiệu suất:");
-            TestContext.WriteLine($" - Số lượng gửi   : {totalMessages:N0} reqs");
-            TestContext.WriteLine($" - Số lượng nhận  : {receivedCount:N0} reqs");
-            TestContext.WriteLine($" - Thời gian xử lý: {elapsedMs:N2} ms");
-            TestContext.WriteLine($" - Thông lượng    : {rps:N0} reqs/sec (RPS)");
-            TestContext.WriteLine("=========================================");
+            TestContext.Out.WriteLine("=========================================");
+            TestContext.Out.WriteLine($"[{testName}] Báo cáo Hiệu suất:");
+            TestContext.Out.WriteLine($" - Số lượng gửi   : {totalMessages:N0} reqs");
+            TestContext.Out.WriteLine($" - Số lượng nhận  : {receivedCount:N0} reqs");
+            TestContext.Out.WriteLine($" - Thời gian xử lý: {elapsedMs:N2} ms");
+            TestContext.Out.WriteLine($" - Thông lượng    : {rps:N0} reqs/sec (RPS)");
+            TestContext.Out.WriteLine("=========================================");
 
             // 7. Xác nhận test Pass/Fail
             Assert.That(completed, Is.True,
@@ -360,7 +360,7 @@ namespace TransactionRouter.Tests
             const int routerCount = 5;
 
             // 1. Khởi tạo Service
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await service.ConnectAsync();
 
             // 2. Khởi tạo 5 Routers
@@ -454,7 +454,7 @@ namespace TransactionRouter.Tests
         public async Task DataAndRouting_Correctness_ServiceToMultiRouter()
         {
             // 1. Khởi tạo 1 Service và 3 Router (ID: 10, 20, 30)
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router1 = new TransactionRouterClient(new[] { NatsUrl }, id: 10);
             await using var router2 = new TransactionRouterClient(new[] { NatsUrl }, id: 20);
             await using var router3 = new TransactionRouterClient(new[] { NatsUrl }, id: 30);
@@ -564,7 +564,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task CleanupLoop_Should_Remove_Inactive_Players_After_10_Seconds()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await service.ConnectAsync();
 
             var db = _redis.GetDatabase();
@@ -606,7 +606,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Single_Message_Larger_Than_MaxBatchSize_Should_Not_Crash()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 1);
 
             await service.ConnectAsync();
@@ -644,7 +644,7 @@ namespace TransactionRouter.Tests
         public async Task Dispose_Subscription_Should_Stop_Receiving_And_Free_Memory()
         {
             // Khởi tạo cả 2 đầu để đi đúng luồng kiến trúc
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 1);
 
             await service.ConnectAsync();
@@ -697,7 +697,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Basic_Async_PingPong_E2E_Success()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 1);
 
             await service.ConnectAsync();
@@ -750,7 +750,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Async_Handler_Should_Process_Batch_Correctly_With_Delays()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 2);
 
             await service.ConnectAsync();
@@ -796,7 +796,7 @@ namespace TransactionRouter.Tests
         [Test]
         public async Task Dispose_Async_Subscription_Should_Stop_Receiving()
         {
-            await using var service = new TransactionServiceClient(new[] { NatsUrl }, RedisUrl);
+            await using var service = new TransactionServer(new[] { NatsUrl }, RedisUrl);
             await using var router = new TransactionRouterClient(new[] { NatsUrl }, id: 3);
 
             await service.ConnectAsync();

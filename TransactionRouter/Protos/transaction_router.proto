@@ -4,12 +4,5 @@ option csharp_namespace = "TransactionRouter.Proto";
 
 message TransactionRequest {
   int64 playerId = 1;
-  string serviceName = 2;
   bytes transactionData = 3;
-}
-
-message BatchTransactionRequest {
-  repeated bytes payload = 1;
-  repeated int64 playerIds = 2;
-  int32 routerId = 3;
 }
